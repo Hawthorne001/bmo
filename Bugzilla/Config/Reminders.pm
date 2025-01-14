@@ -5,7 +5,7 @@
 # This Source Code Form is "Incompatible With Secondary Licenses", as
 # defined by the Mozilla Public License, v. 2.0.
 
-package Bugzilla::Extension::GoogleAnalytics::Config;
+package Bugzilla::Config::Reminders;
 
 use 5.10.1;
 use strict;
@@ -16,23 +16,17 @@ use Bugzilla::Config::Common;
 sub get_param_list {
   my ($class) = @_;
 
-  my @params = (
+  my @param_list = (
+    {name => 'reminders_enabled', type => 'b', default => '0',},
     {
-      name    => 'google_analytics_tracking_id',
-      type    => 't',
-      default => '',
-      checker => sub {
-        my ($tracking_id) = (@_);
-
-        return 'must be like UA-XXXXXX-X'
-          unless $tracking_id =~ m{^(UA-[[:xdigit:]]+-[[:xdigit:]]+)?$};
-        return '';
-      }
+      name    => 'reminders_group',
+      type    => 's',
+      choices => \&get_all_group_names,
+      default => 'editbugs',
+      checker => \&check_group
     },
-    {name => 'google_analytics_debug', type => 'b', default => 0},
   );
-
-  return @params;
+  return @param_list;
 }
 
 1;
