@@ -21,7 +21,7 @@ function slide_module(module, action, fast) {
             'aria-label': is_visible ? latch.data('label-expanded') : latch.data('label-collapsed'),
         });
         if (BUGZILLA.user.settings.remember_collapsed && module.is(':visible'))
-            localStorage.setItem(module.attr('id') + '.visibility', is_visible ? 'show' : 'hide');
+            Bugzilla.Storage.set(module.attr('id') + '.visibility', is_visible ? 'show' : 'hide');
     }
 
     if (action == 'show') {
@@ -43,7 +43,7 @@ function init_module_visibility() {
         var id = that.attr('id');
         if (!id) return;
         if (that.data('non-stick')) return;
-        var stored = localStorage.getItem(id + '.visibility');
+        var stored = Bugzilla.Storage.get(id + '.visibility');
         if (stored) {
             slide_module(that, stored, true);
         }
@@ -139,7 +139,7 @@ $(function() {
     // restore edit mode after navigating back
     function restoreEditMode() {
         if (!$('#editing').val()) {
-            if (localStorage.getItem('modal-perm-edit-mode') === 'true') {
+            if (Bugzilla.Storage.get('modal-perm-edit-mode') === true) {
                 $('#mode-btn').click();
                 $('#action-enable-perm-edit').attr('aria-checked', 'true');
             }
@@ -170,7 +170,7 @@ $(function() {
             text: text,
             savedAt: Date.now()
         };
-        localStorage.setItem(bugCommentCacheKey, JSON.stringify(value));
+        Bugzilla.Storage.set(bugCommentCacheKey, JSON.stringify(value));
     }
 
     /**
@@ -180,7 +180,7 @@ $(function() {
      * to take such special cases into account. Otherwise the current bug’s comment cache will be removed.
      */
     const clearSavedBugComment = (bug_id = BUGZILLA.bug_id) => {
-        localStorage.removeItem(`bug-modal-saved-comment-${bug_id}`);
+        Bugzilla.Storage.delete(`bug-modal-saved-comment-${bug_id}`);
     };
 
     /**
@@ -200,23 +200,23 @@ $(function() {
 
     function restoreSavedBugComment() {
         expireSavedComments();
-        let value = JSON.parse(localStorage.getItem(bugCommentCacheKey));
+        let value = Bugzilla.Storage.get(bugCommentCacheKey);
         if (value){
             let commentBox = document.querySelector("textarea#comment");
-            commentBox.value = value['text'];
-            if (BUGZILLA.user.settings.autosize_comments) {
-                autosize.update(commentBox);
-            }
+            if (commentBox.value === '')
+              commentBox.value = value['text'];
+            // Resize the textarea and enable the Preview button
+            commentBox.dispatchEvent(new InputEvent('input'));
         }
     }
 
     function expireSavedComments() {
         const AGE_THRESHOLD = 7 * 24 * 60 * 60 * 1000; // 7 days in milliseconds.
         let expiredKeys = [];
-        for (let i = 0; i < localStorage.length; i++) {
-            let key = localStorage.key(i);
+        for (let i = 0; i < window.localStorage.length; i++) {
+            let key = window.localStorage.key(i);
             if (key.match(/^bug-modal-saved-comment-/)) {
-                let value = JSON.parse(localStorage.getItem(key));
+                let value = Bugzilla.Storage.get(key);
                 let savedAt = value['savedAt'] || 0;
                 let age = Date.now() - savedAt;
                 if (age < 0 || age > AGE_THRESHOLD) {
@@ -225,7 +225,7 @@ $(function() {
             }
         }
         expiredKeys.forEach((key) => {
-            localStorage.removeItem(key);
+            Bugzilla.Storage.delete(key);
         });
     }
 
@@ -296,11 +296,22 @@ $(function() {
             $(this).hide();
         });
 
+    const $tooltipParent = document.querySelector('#bugzilla-body');
+
     // use non-native tooltips for relative/absolute times and bug summaries
     const tooltip_sources = $('.rel-time, .rel-time-title, .abs-time-title, .bz_bug_link, .tt').tooltip({
         position: { my: "left top+8", at: "left bottom", collision: "flipfit" },
         show: { effect: 'none' },
-        hide: { effect: 'none' }
+        hide: { effect: 'none' },
+        // Change the parent element from `<body>` to the main scrolling area and recalculate the
+        // position when a tooltip is displayed, so that it won’t be affected by the fixed header
+        open: (event, ui) => {
+          const $tooltip = /** @type {HTMLElement} */ (ui.tooltip[0]);
+          const currentTop = Number.parseInt($tooltip.style.top, 10);
+
+          $tooltip.style.top = `${currentTop - $tooltipParent.offsetTop + $tooltipParent.scrollTop}px`;
+          $tooltipParent.appendChild($tooltip);
+        }
     });
 
     // Don't show the tooltip when the window gets focus
@@ -532,7 +543,7 @@ $(function() {
             event.preventDefault();
             const enabled = $(this).attr('aria-checked') !== 'true';
             $(this).attr('aria-checked', enabled);
-            localStorage.setItem('modal-perm-edit-mode', enabled);
+            Bugzilla.Storage.set('modal-perm-edit-mode', enabled);
         });
 
     // reset
@@ -907,6 +918,22 @@ $(function() {
             }
         });
 
+    // bug reminder button
+    $('#reminder-btn')
+        .click(event => {
+            event.preventDefault();
+            const is_reminded = $(event.target).data('is-reminded') == '1';
+            const has_needinfo_from = $(event.target).data('has-needinfo-from');
+            let query_string = "tab=reminders";
+            if (!is_reminded) {
+                query_string += `&bug_id=${BUGZILLA.bug_id}`;
+            }
+            if (has_needinfo_from) {
+                query_string += `&note=Needinfo+requested+by+${encodeURIComponent(has_needinfo_from)}`;
+            }
+            window.location = `${BUGZILLA.config.basepath}userprefs.cgi?${query_string}`;
+        });
+
     // cancel button, reset the ui back to read-only state
     // for now, do this with a redirect to self
     // ideally this should revert all field back to their initially loaded
@@ -1097,7 +1124,7 @@ $(function() {
 
             if (BUGZILLA.user.settings.quote_replies == 'quoted_reply') {
                 var $comment = $('#ct-' + comment_no);
-                if ($comment.attr('data-ismarkdown')) {
+                if ($comment.is('.markdown-body')) {
                     quoteMarkdown($comment);
                 } else {
                     reply_text = prefix + wrapReplyText($comment.text());
@@ -1268,20 +1295,6 @@ $(function() {
                     if ($('#cancel-btn:visible').length === 0) {
                         event.preventDefault();
                         $('#mode-btn').click();
-                    }
-                    break;
-
-                // ctrl+shift+p = toggle comment preview
-                case 'p':
-                    if (event.metaKey || !event.shiftKey)
-                        return;
-                    if (document.activeElement.id == 'comment') {
-                        event.preventDefault();
-                        $('#comment-preview-tab').click();
-                    }
-                    else if ($('#comment-preview:visible').length !== 0) {
-                        event.preventDefault();
-                        $('#comment-edit-tab').click();
                     }
                     break;
             }
@@ -1508,84 +1521,6 @@ $(function() {
                 .show();
         });
 
-    // comment preview
-    var last_comment_text = '';
-    $('#comment-tabs li').click(async event => {
-        var that = $(event.target);
-        var context = that.closest('form');
-
-        if (that.attr('aria-selected') === 'true')
-            return;
-
-        // ensure preview's height matches the comment
-        var comment = $('#comment', context);
-        var preview = $('#comment-preview', context);
-        var comment_height = comment[0].offsetHeight;
-
-        // change tabs
-        $('#comment-tabs li', context).attr({ tabindex: -1, 'aria-selected': false });
-        $('.comment-tabpanel', context).hide();
-        that.attr({ tabindex: 0, 'aria-selected': true });
-        var tabpanel = $('#' + that.attr('aria-controls'), context).show();
-        var focus = that.data('focus');
-        if (focus !== '') {
-            $('#' + focus, context).focus();
-        }
-
-        // update preview
-        preview.css('height', comment_height + 'px');
-        if (!tabpanel.attr('id').endsWith('comment-preview-tabpanel') || last_comment_text == comment.val())
-            return;
-        $('#preview-throbber', context).show();
-        preview.html('');
-
-        try {
-            const { html } = await Bugzilla.API.post('bug/comment/render', { text: comment.val() });
-
-            $('#preview-throbber', context).hide();
-            preview.html(html);
-
-            // Highlight code if possible
-            if (Prism) {
-                Prism.highlightAllUnder(preview.get(0));
-            }
-        } catch ({ message }) {
-            $('#preview-throbber', context).hide();
-            var container = $('<div/>');
-            container.addClass('preview-error');
-            container.text(message);
-            preview.html(container);
-        }
-
-        last_comment_text = comment.val();
-    }).keydown(function(event) {
-        var that = $(this);
-        var context = that.closest('form');
-        var tabs = $('#comment-tabs li', context);
-        var target;
-
-        // enable keyboard navigation on tabs
-        switch (event.keyCode) {
-            case 35: // End
-                target = tabs.last();
-                break;
-            case 36: // Home
-                target = tabs.first();
-                break;
-            case 37: // Left arrow
-                target = that.prev('[role="tab"]');
-                break;
-            case 39: // Right arrow
-                target = that.next('[role="tab"]');
-                break;
-        }
-
-        if (target && target.length) {
-            event.preventDefault();
-            target.click().focus();
-        }
-    });
-
     // dirty field tracking
     $('#changeform select')
         .change(function() {
@@ -1734,7 +1669,7 @@ async function show_new_changes_indicator() {
             $link.remove();
             $.scrollTo($separator);
         }, { once: true });
-        document.querySelector('#changeform').insertAdjacentElement('beforebegin', $link);
+        document.querySelector('#bugzilla-body').insertAdjacentElement('beforebegin', $link);
 
         // Insert a separator
         $separator.className = 'new-changes-separator';

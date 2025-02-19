@@ -410,7 +410,7 @@ sub parse_bounty_attachment_description {
     fixed_date     => $+{fixed_date} // '',
     awarded_date   => $+{awarded_date} // '',
     publish        => $map{$+{publish} // 'false'},
-    credit         => [grep {$_} split(/\s*,\s*/, $+{credits})]
+    credit         => [grep {$_} split(/\s*,\s*/, $+{credits} || '')]
   };
 }
 
@@ -1383,6 +1383,21 @@ sub db_schema_abstract_schema {
       last_run => {TYPE => 'DATETIME',     NOTNULL => 1,},
     ],
     INDEXES => [job_last_run_name_idx => {FIELDS => ['name'], TYPE => 'UNIQUE',},],
+  };
+  $args->{schema}->{bmo_etl_cache} = {
+    FIELDS => [
+      id            => {TYPE => 'INT3',         NOTNULL => 1,},
+      snapshot_date => {TYPE => 'DATETIME',     NOTNULL => 1,},
+      table_name    => {TYPE => 'VARCHAR(100)', NOTNULL => 1,},
+      data          => {TYPE => 'LONGBLOB',     NOTNULL => 1,},
+    ],
+    INDEXES =>
+      [bmo_etl_cache_idx => {FIELDS => ['id', 'snapshot_date', 'table_name']}],
+  };
+  $args->{schema}->{bmo_etl_locked} = {
+    FIELDS => [
+      value => {TYPE => 'VARCHAR(20)', NOTNULL => 1,},
+    ],
   };
 }
 
@@ -2588,6 +2603,33 @@ sub config_modify_panels {
     name    => 'enable_triaged_keyword',
     type    => 'b',
     };
+  push @{$args->{panels}->{reports}->{params}},
+    {
+    name => 'bmo_etl_enabled',
+    type => 'b',
+    default => 0,
+    };
+  push @{$args->{panels}->{reports}->{params}},
+    {
+    name => 'bmo_etl_base_url',
+    type => 't',
+    };
+  push @{$args->{panels}->{reports}->{params}},
+    {
+    name => 'bmo_etl_service_account',
+    type => 't',
+    };
+  push @{$args->{panels}->{reports}->{params}},
+    {
+    name => 'bmo_etl_project_id',
+    type => 't',
+    };
+  push @{$args->{panels}->{reports}->{params}},
+    {
+    name => 'bmo_etl_dataset_id',
+    type => 't',
+    };
+
 }
 
 sub comment_after_add_tag {
