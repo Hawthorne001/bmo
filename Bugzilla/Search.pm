@@ -366,8 +366,8 @@ sub SPECIAL_PARSING {
     # Pronoun Fields (Ones that can accept %user%, etc.)
     assigned_to             => \&_contact_pronoun,
     'attachments.submitter' => \&_contact_pronoun,
-    cc                      => \&_cc_pronoun,
-    commenter               => \&_commenter_pronoun,
+    cc                      => \&_contact_pronoun,
+    commenter               => \&_contact_pronoun,
     qa_contact              => \&_contact_pronoun,
     reporter                => \&_contact_pronoun,
     'requestees.login_name' => \&_contact_pronoun,
@@ -384,7 +384,7 @@ sub SPECIAL_PARSING {
     bug_interest_ts => \&_last_visit_datetime,
 
     # BMO - Add ability to use pronoun for bug mentors field
-    bug_mentor => \&_commenter_pronoun,
+    bug_mentor => \&_contact_pronoun,
 
     # BMO - add ability to use pronoun for triage owners
     triage_owner => \&_triage_owner_pronoun,
@@ -955,11 +955,23 @@ sub _sql {
     $limit    = '';
   }
 
+  # Add some user information to the SQL so we can pinpoint where some
+  # slow running queries originate and help to refine the searches.
+  my $user_id = Bugzilla->user->id;
+  my $remote_ip = remote_ip();
+  my $user_agent = Bugzilla->cgi->user_agent;
+  my $query_string = Bugzilla->cgi->canonicalize_query();
   my $query = <<END;
 SELECT $select
   FROM $from
  WHERE $where
 $group_by$order_by$limit
+/*
+user-id: $user_id
+remote-ip: $remote_ip
+user-agent: $user_agent
+query-string: $query_string
+*/
 END
   $self->{sql} = $query;
   return $self->{sql};
@@ -1475,48 +1487,45 @@ sub _translate_join {
 # group security.
 sub _standard_where {
   my ($self) = @_;
-  return ('1=1') if $self->{_no_security_check};
+  my $userid = $self->_user->id;
 
-  # If replication lags badly between the shadow db and the main DB,
-  # it's possible for bugs to show up in searches before their group
-  # controls are properly set. To prevent this, when initially creating
-  # bugs we set their creation_ts to NULL, and don't give them a creation_ts
-  # until their group controls are set. So if a bug has a NULL creation_ts,
-  # it shouldn't show up in searches at all.
-  my @where = ('bugs.creation_ts IS NOT NULL');
-
-  my $security_term = 'security_map.group_id IS NULL';
-
-  my $user = $self->_user;
-  if ($user->id) {
-    my $userid = $user->id;
-
-    # This indentation makes the resulting SQL more readable.
-    $security_term .= <<END;
-
-        OR (bugs.reporter_accessible = 1 AND bugs.reporter = $userid)
-        OR (bugs.cclist_accessible = 1 AND security_cc.who IS NOT NULL)
-        OR bugs.assigned_to = $userid
-END
-    if (Bugzilla->params->{'useqacontact'}) {
-      $security_term .= "        OR bugs.qa_contact = $userid";
-    }
-    $security_term = "($security_term)";
+  if ($self->{_no_security_check}) {
+    # If security checks have already been performed, there's no need to repeat
+    # in sub-queries.
+    return "";
   }
 
-  push(@where, $security_term);
+  # Public bugs are always visible.
+  my $term = 'security_map.group_id IS NULL';
 
-  return @where;
+  if ($userid) {
+    # Authenticated; users directly associated with the bug have visibility.
+    my @involved = (
+        "bugs.reporter_accessible = 1 AND bugs.reporter = $userid",
+        'bugs.cclist_accessible = 1 AND security_cc.who IS NOT NULL',
+        "bugs.assigned_to = $userid",
+    );
+    if (Bugzilla->params->{'useqacontact'}) {
+      push @involved, ("bugs.qa_contact = $userid");
+    }
+    $term .= ' OR (' . join(') OR (', @involved) . ')';
+  }
+
+  return $term;
 }
 
 sub _sql_where {
   my ($self, $main_clause) = @_;
 
-  # The newline and this particular spacing makes the resulting
-  # SQL a bit more readable for debugging.
-  my $where = join("\n   AND ", $self->_standard_where);
+  my $where = "";
+  my $where_sql = $self->_standard_where();
+  $where .= '(' . $where_sql . ')' if $where_sql;
+
   my $clause_sql = $main_clause->as_string;
-  $where .= "\n   AND " . $clause_sql if $clause_sql;
+  if ($clause_sql) {
+    $where .= " AND " if $where_sql;
+    $where .= $clause_sql;
+  }
   return $where;
 }
 
@@ -1772,8 +1781,9 @@ sub _special_parse_email {
     my $id    = $1;
     my $email = trim($params->{"email$id"});
     next if !$email;
-    my $type = $params->{"emailtype$id"} || 'anyexact';
-    $type = "anyexact" if $type eq "exact";
+    my $type = $params->{"emailtype$id"} || 'equals';
+    # for backward compatibility
+    $type = "equals" if $type eq "exact";
 
     my $or_clause = new Bugzilla::Search::Clause('OR');
     foreach my $field (qw(assigned_to reporter cc qa_contact bug_mentor)) {
@@ -2445,8 +2455,8 @@ sub _contact_pronoun {
 
 sub _contact_exact_group {
   my ($self, $args) = @_;
-  my ($value, $operator, $field, $chart_id, $joins)
-    = @$args{qw(value operator field chart_id joins)};
+  my ($value, $operator, $field, $chart_id, $joins, $sequence)
+    = @$args{qw(value operator field chart_id joins sequence)};
   my $dbh  = Bugzilla->dbh;
   my $user = $self->_user;
 
@@ -2466,11 +2476,29 @@ sub _contact_exact_group {
   $group->check_members_are_visible();
 
   my $group_ids = Bugzilla::Group->flatten_group_membership($group->id);
+
+  if ($field eq 'cc' && $chart_id eq '') {
+    # This is for the email1, email2, email3 fields from query.cgi.
+    $chart_id = "CC$$sequence";
+    $args->{sequence}++;
+  }
+
+  my $from = $field;
+
+  # These fields need an additional table.
+  if ($field eq 'commenter' || $field eq 'cc') {
+    my $join_table = $field;
+    $join_table = 'longdescs' if $field eq 'commenter';
+    my $join_table_alias = "${field}_$chart_id";
+    push @$joins, {table => $join_table, as => $join_table_alias};
+    $from = "$join_table_alias.who";
+  }
+
   my $table     = "user_group_map_$chart_id";
   my $join      = {
     table => 'user_group_map',
     as    => $table,
-    from  => $field,
+    from  => $from,
     to    => 'user_id',
     extra => [$dbh->sql_in("$table.group_id", $group_ids), "$table.isbless = 0"],
   };
@@ -2480,79 +2508,6 @@ sub _contact_exact_group {
   }
   else {
     $args->{term} = "$table.group_id IS NOT NULL";
-  }
-}
-
-sub _cc_pronoun {
-  my ($self,       $args)  = @_;
-  my ($full_field, $value) = @$args{qw(full_field value)};
-  my $user = $self->_user;
-
-  if ($value =~ /\%group/) {
-    return $self->_cc_exact_group($args);
-  }
-  elsif ($value =~ /^(%\w+%)$/) {
-    $args->{value}       = pronoun($1, $user);
-    $args->{quoted}      = $args->{value};
-    $args->{value_is_id} = 1;
-  }
-}
-
-sub _cc_exact_group {
-  my ($self, $args) = @_;
-  my ($chart_id, $sequence, $joins, $operator, $value)
-    = @$args{qw(chart_id sequence joins operator value)};
-  my $user = $self->_user;
-  my $dbh  = Bugzilla->dbh;
-
-  $value =~ m/%group\.([^%]+)%/;
-  my $group
-    = Bugzilla::Group->check({name => $1, _error => 'invalid_group_name'});
-  $group->check_members_are_visible();
-  $user->in_group($group)
-    || ThrowUserError('invalid_group_name', {name => $group->name});
-
-  my $all_groups = Bugzilla::Group->flatten_group_membership($group->id);
-
-  # This is for the email1, email2, email3 fields from query.cgi.
-  if ($chart_id eq "") {
-    $chart_id = "CC$$sequence";
-    $args->{sequence}++;
-  }
-
-  my $cc_table = "cc_$chart_id";
-  push(@$joins, {table => 'cc', as => $cc_table});
-  my $group_table = "user_group_map_$chart_id";
-  my $group_join  = {
-    table => 'user_group_map',
-    as    => $group_table,
-    from  => "$cc_table.who",
-    to    => 'user_id',
-    extra => [
-      $dbh->sql_in("$group_table.group_id", $all_groups),
-      "$group_table.isbless = 0"
-    ],
-  };
-  push(@$joins, $group_join);
-
-  if ($operator =~ /^not/) {
-    $args->{term} = "$group_table.group_id IS NULL";
-  }
-  else {
-    $args->{term} = "$group_table.group_id IS NOT NULL";
-  }
-}
-
-# XXX This should probably be merged with cc_pronoun.
-sub _commenter_pronoun {
-  my ($self, $args) = @_;
-  my $value = $args->{value};
-  my $user  = $self->_user;
-
-  if ($value =~ /^(%\w+%)$/) {
-    $args->{value}       = pronoun($1, $user);
-    $args->{quoted}      = $args->{value};
-    $args->{value_is_id} = 1;
   }
 }
 
@@ -2571,6 +2526,17 @@ sub _triage_owner_pronoun {
       ThrowUserError('login_required_for_pronoun');
     }
   }
+}
+
+sub _get_user_id {
+  my ($self, $value) = @_;
+
+  # If the user value is formatted as a pronoun
+  # then return the converted value for the user
+  if ($value =~ /^%\w+%$/) {
+    return pronoun($value, $self->_user);
+  }
+  return login_to_id($value, THROW_ERROR);
 }
 
 ######################################
@@ -2728,7 +2694,7 @@ sub _long_desc_changedby {
 
   my $table = "longdescs_$chart_id";
   push(@$joins, {table => 'longdescs', as => $table});
-  my $user_id = login_to_id($value, THROW_ERROR);
+  my $user_id = $self->_get_user_id($value);
   $args->{term} = "$table.who = $user_id";
 }
 
@@ -2896,7 +2862,7 @@ sub _work_time_changedby {
 
   my $table = "longdescs_$chart_id";
   push(@$joins, {table => 'longdescs', as => $table});
-  my $user_id = login_to_id($value, THROW_ERROR);
+  my $user_id = $self->_get_user_id($value);
   $args->{term} = "$table.who = $user_id AND $table.work_time != 0";
 }
 
@@ -3695,7 +3661,11 @@ sub _changedby {
     push(@{$join->{extra}}, "$table.fieldid = $field_id");
   }
 
-  my $user_id = login_to_id($value, THROW_ERROR);
+  # We may have already converted to user id if use of pronoun so skip
+  my $user_id = $value;
+  if ($value !~ /^\d+$/) {
+    $user_id = $self->_get_user_id($value);
+  }
   push(@{$join->{extra}}, "$table.who = $user_id");
 
   $args->{term} = "$table.bug_when IS NOT NULL";

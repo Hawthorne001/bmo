@@ -2,11 +2,12 @@
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at http://mozilla.org/MPL/2.0/.
 
-version: "3"
-
 services:
   bmo.test:
-    image: bmo
+    build: &build_bmo
+      context: .
+      dockerfile: Dockerfile
+      target: test
     command: dev_httpd
     tmpfs:
       - /tmp
@@ -26,6 +27,7 @@ services:
       - BZ_ANSWERS_FILE=/app/conf/checksetup_answers.txt
       - BZ_QA_CONF_FILE=/app/qa/config/selenium_test.conf
       - BZ_QA_CONFIG=1
+      - CI=1
       - LOCALCONFIG_ENV=1
       - LOG4PERL_CONFIG_FILE=log4perl-test.conf
       - LOGGING_PORT=5880
@@ -36,9 +38,10 @@ services:
       - memcached
       - s3
       - gcs
+      - bq
 
   externalapi.test:
-    image: bmo
+    build: *build_bmo
     entrypoint: perl /app/external_test_api.pl daemon -l http://*:8001
     ports:
       - 8001:8001
@@ -56,7 +59,7 @@ services:
       - MYSQL_ALLOW_EMPTY_PASSWORD=1
 
   memcached:
-    image:  ghcr.io/ghcr-library/memcached:latest
+    image: ghcr.io/ghcr-library/memcached:latest
 
   s3:
     image: scireum/s3-ninja
@@ -68,3 +71,13 @@ services:
       - ./docker/gcs/attachments:/data/attachments
       - ./docker/gcs/sitemapindex:/data/sitemapindex
       - ./docker/gcs/mining:/data/mining
+
+  bq:
+    build:
+      context: ./docker/bigquery
+      dockerfile: Dockerfile
+    ports:
+      - 9050:9050
+    working_dir: /work
+    command: |
+      --project=test --data-from-yaml=/data.yaml
